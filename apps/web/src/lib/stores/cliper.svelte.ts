@@ -225,6 +225,8 @@ export class CliperStore {
 		ffmpegPreview: ''
 	});
 
+	private renderPollTimeout: ReturnType<typeof setTimeout> | null = null;
+
 	// Active tab on right panel
 	activeTab = $state<'transcript' | 'font' | 'render'>('transcript');
 
@@ -809,35 +811,159 @@ export class CliperStore {
   -y output_916_${this.render.layout}.mp4`;
 	}
 
+	resolveResultUrl(pathOrUrl: string): string {
+		if (!pathOrUrl) return '';
+		if (pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://') || pathOrUrl.startsWith('blob:')) {
+			return pathOrUrl;
+		}
+		const base = this.apiUrl.replace(/\/$/, '');
+		const cleanPath = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
+		return `${base}${cleanPath}`;
+	}
+
+	clearRenderPoll() {
+		if (this.renderPollTimeout) {
+			clearTimeout(this.renderPollTimeout);
+			this.renderPollTimeout = null;
+		}
+	}
+
+	startRenderPolling(jobId: string) {
+		this.clearRenderPoll();
+
+		const startTime = Date.now();
+		const TIMEOUT_MS = 5 * 60 * 1000; // batas aman 5 menit
+		const POLL_INTERVAL_MS = 1200; // polling GET tiap ~1.2 detik
+
+		const poll = async () => {
+			if (Date.now() - startTime > TIMEOUT_MS) {
+				this.render.status = 'failed';
+				this.render.error = 'Render timeout: proses melebihi batas waktu aman (5 menit)';
+				this.clearRenderPoll();
+				return;
+			}
+
+			try {
+				const statusUrl = `${this.apiUrl.replace(/\/$/, '')}/api/clips/render/${encodeURIComponent(jobId)}`;
+				const res = await fetch(statusUrl);
+
+				if (!res.ok) {
+					let errMsg = `Gagal memeriksa status render (${res.status} ${res.statusText})`;
+					try {
+						const errData = await res.json();
+						if (errData?.error) errMsg = errData.error;
+						else if (errData?.message) errMsg = errData.message;
+					} catch {
+						// ignore parse error
+					}
+					throw new Error(errMsg);
+				}
+
+				const data: {
+					jobId?: string;
+					status?: 'queued' | 'processing' | 'done' | 'failed';
+					progress?: number;
+					resultUrl?: string;
+					error?: string;
+					duration?: number;
+					size?: number;
+				} = await res.json();
+
+				if (data.status) {
+					this.render.status = data.status;
+				}
+				if (typeof data.progress === 'number') {
+					this.render.progress = Math.max(0, Math.min(100, Math.round(data.progress)));
+				}
+
+				if (data.status === 'done') {
+					this.render.status = 'done';
+					this.render.progress = 100;
+					if (data.resultUrl) {
+						this.render.resultUrl = this.resolveResultUrl(data.resultUrl);
+					}
+					if (typeof data.duration === 'number') this.render.duration = data.duration;
+					if (typeof data.size === 'number') this.render.size = data.size;
+					this.clearRenderPoll();
+					return;
+				}
+
+				if (data.status === 'failed') {
+					this.render.status = 'failed';
+					this.render.error = data.error || 'Proses render gagal di server';
+					this.clearRenderPoll();
+					return;
+				}
+
+				// Lanjut polling jika masih queued atau processing
+				this.renderPollTimeout = setTimeout(poll, POLL_INTERVAL_MS);
+			} catch (err: any) {
+				this.render.status = 'failed';
+				this.render.error = err?.message || 'Koneksi ke server render terputus';
+				this.clearRenderPoll();
+			}
+		};
+
+		this.renderPollTimeout = setTimeout(poll, POLL_INTERVAL_MS);
+	}
+
 	async sendRenderJob() {
-		this.render.status = 'rendering';
-		this.render.progress = 5;
+		if (this.render.status === 'queued' || this.render.status === 'processing') {
+			return;
+		}
+
+		this.clearRenderPoll();
+		this.render.status = 'queued';
+		this.render.progress = 0;
 		this.render.error = undefined;
+		this.render.resultUrl = undefined;
+		this.render.jobId = undefined;
+		this.render.duration = undefined;
+		this.render.size = undefined;
 		this.render.ffmpegPreview = this.generateFfmpegCommand();
+
+		let layout: 'portrait' | 'landscape' | 'square' = 'portrait';
+		if (this.wizard.targetRatio === '1:1') {
+			layout = 'square';
+		} else if (this.wizard.targetRatio === '16:9') {
+			layout = 'landscape';
+		} else {
+			layout = 'portrait';
+		}
+
+		const normalizedCropX = Math.max(
+			0,
+			Math.min(1, Number(((this.cropX + 100) / 200).toFixed(4)))
+		);
 
 		const payload = {
 			clipId: this.fileKey || 'source.mp4',
-			videoUrl: this.videoUrl || 'source.mp4',
-			layout: this.render.layout === 'split' ? 'portrait' : 'portrait',
-			cropX: this.cropX,
+			layout,
+			cropX: normalizedCropX,
 			cuts: this.cuts.map((c) => ({
-				start: c.start,
-				end: c.end
+				start: Number(c.start.toFixed(3)),
+				end: Number(c.end.toFixed(3))
 			})),
 			chunks: this.chunks.map((c) => ({
 				id: c.id,
-				start: c.start,
-				end: c.end,
+				start: Number(c.start.toFixed(3)),
+				end: Number(c.end.toFixed(3)),
 				words: c.words.map((w) => ({
 					id: w.id,
 					text: w.text,
-					start: w.start,
-					end: w.end,
-					cut: w.cut,
-					accent: w.accent
+					start: Number(w.start.toFixed(3)),
+					end: Number(w.end.toFixed(3)),
+					cut: !!w.cut,
+					accent: !!w.accent
 				}))
 			})),
-			captionStyle: this.captionStyle
+			captionStyle: {
+				fontFamily: this.captionStyle.fontFamily,
+				fontSize: this.captionStyle.fontSize,
+				allCaps: this.captionStyle.allCaps,
+				color: this.captionStyle.primaryColor,
+				accentColor: this.captionStyle.accentColor
+			}
 		};
 
 		try {
@@ -849,25 +975,33 @@ export class CliperStore {
 			});
 
 			if (!res.ok) {
-				throw new Error(`Server respon: ${res.status} ${res.statusText}`);
+				let errMsg = `Server respon: ${res.status} ${res.statusText}`;
+				try {
+					const errJson = await res.json();
+					if (errJson?.error) errMsg = errJson.error;
+					else if (errJson?.message) errMsg = errJson.message;
+				} catch {
+					// ignore json error
+				}
+				throw new Error(errMsg);
 			}
 
-			const data = await res.json().catch(() => ({}));
-			this.render.status = 'completed';
-			this.render.progress = 100;
-			this.render.resultUrl = data.resultUrl || '/output_916_demo.mp4';
+			const data = await res.json();
+			if (!data?.jobId) {
+				throw new Error('Respon backend tidak mengandung jobId');
+			}
+
+			this.render.jobId = data.jobId;
+			this.render.status = data.status || 'queued';
+			this.render.progress = typeof data.progress === 'number' ? data.progress : 5;
+			if (data.ffmpegPreview) {
+				this.render.ffmpegPreview = data.ffmpegPreview;
+			}
+
+			this.startRenderPolling(data.jobId);
 		} catch (err: any) {
-			// Simulasi proses render lokal jika backend offline
-			console.warn('Backend render offline, menjalankan simulasi pratinjau:', err.message);
-			this.render.progress = 25;
-			setTimeout(() => {
-				this.render.progress = 65;
-				setTimeout(() => {
-					this.render.progress = 100;
-					this.render.status = 'completed';
-					this.render.resultUrl = this.videoUrl || '#';
-				}, 600);
-			}, 600);
+			this.render.status = 'failed';
+			this.render.error = err?.message || 'Gagal mengirim job render ke server';
 		}
 	}
 }

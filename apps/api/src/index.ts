@@ -7,8 +7,19 @@ import { config, getMaskedAiConfig, updateAiConfig, validateConfig } from "./con
 import { transcribe } from "./services/ninerouter.ts";
 import { transcribeElevenLabs } from "./services/elevenlabs.ts";
 import { buildRenderCommand, convertToMp3, detectSpeechSegments } from "./services/ffmpeg.ts";
+import { createJob, getJob, runRender } from "./services/render.ts";
 import type { SpeechSegment, TranscriptResult, VideoLayout } from "./types.ts";
-import { chunksToSrt, probe, type Word, type Chunk, type EDLCut, type RenderPlan } from "@cliper/core";
+import {
+  chunksToSrt,
+  probe,
+  buildAss,
+  type Word,
+  type Chunk,
+  type EDLCut,
+  type RenderPlan,
+  type AssChunkInput,
+  type AssCaptionStyle,
+} from "@cliper/core";
 
 export const MAX_UPLOAD_SIZE = 500 * 1024 * 1024; // 500 MB
 
@@ -370,43 +381,86 @@ export const app = new Elysia({
   )
   .post(
     "/api/clips/render",
-    ({ body, set }) => {
-      const { clipId, cuts, layout = "portrait", cropX = 0.5 } = body;
+    async ({ body, set }) => {
+      const { clipId, cuts, layout = "portrait", cropX = 0.5, chunks, captionStyle } = body;
       const cleanClipId = sanitizeFileKey(clipId);
       if (!cleanClipId) {
         set.status = 400;
         return { error: "Invalid clipId" };
       }
 
-      const inputPath = findUploadedFile(cleanClipId) || path.resolve(config.uploadsDir, cleanClipId);
-      const outputPath = path.resolve(config.uploadsDir, `${cleanClipId}.rendered.mp4`);
+      const inputPath = findUploadedFile(cleanClipId);
+      if (!inputPath) {
+        set.status = 404;
+        return { error: `File not found: ${cleanClipId} in ${config.uploadsDir}` };
+      }
 
-      // Stub validation + build 1-pass ffmpeg command
-      const ffmpegPreview = buildRenderCommand({
+      const clampedCropX = Math.max(0, Math.min(1, typeof cropX === "number" ? cropX : 0.5));
+
+      // Probe duration
+      let probedDuration = 0;
+      try {
+        const p = await probe(inputPath);
+        if (p && p.duration > 0) probedDuration = p.duration;
+      } catch {
+        // ignore probe error
+      }
+
+      const rawCuts = cuts || [];
+      const validCuts = rawCuts.filter((c) => c && typeof c.start === "number" && typeof c.end === "number" && c.end > c.start && c.start >= 0);
+      const targetDuration =
+        validCuts.length > 0
+          ? validCuts.reduce((acc, c) => acc + (c.end - c.start), 0)
+          : probedDuration || 10;
+
+      // Handle subtitle ASS generation if chunks are provided
+      let assPath: string | undefined;
+      if (chunks && chunks.length > 0) {
+        const width = layout === "landscape" ? 1920 : 1080;
+        const height = layout === "landscape" ? 1080 : (layout === "square" ? 1080 : 1920);
+        const assContent = buildAss({
+          chunks: chunks as AssChunkInput[],
+          style: captionStyle as AssCaptionStyle,
+          width,
+          height,
+        });
+
+        assPath = path.resolve(config.uploadsDir, `${cleanClipId}.${Date.now()}.ass`);
+        writeFileSync(assPath, assContent, "utf-8");
+      }
+
+      const fontsDir = path.resolve(import.meta.dir, "../fonts");
+      const timestamp = Date.now();
+      const outputFileName = `${cleanClipId}.rendered.${timestamp}.mp4`;
+      const outputPath = path.resolve(config.uploadsDir, outputFileName);
+      const resultUrl = `/outputs/${outputFileName}`;
+
+      const job = createJob();
+      job.resultUrl = resultUrl;
+
+      // Launch real render in background
+      runRender(job.jobId, {
         inputPath,
         outputPath,
-        cuts,
-        layout: layout as VideoLayout,
-        cropX,
+        cuts: validCuts,
+        layout,
+        cropX: clampedCropX,
+        assPath,
+        fontsDir,
+        targetDuration,
+        tempAssPath: assPath,
       });
 
+      set.status = 202;
       return {
+        jobId: job.jobId,
         status: "queued",
-        clipId: cleanClipId,
-        ffmpegPreview,
+        resultUrl,
       };
     },
     {
       body: t.Object({
         clipId: t.String(),
-        cuts: t.Optional(
-          t.Array(
-            t.Object({
-              start: t.Number(),
-              end: t.Number(),
-            })
-          )
-        ),
         layout: t.Optional(
           t.Union([
             t.Literal("portrait"),
@@ -415,9 +469,77 @@ export const app = new Elysia({
           ])
         ),
         cropX: t.Optional(t.Number()),
+        cuts: t.Optional(
+          t.Array(
+            t.Object({
+              start: t.Number(),
+              end: t.Number(),
+            })
+          )
+        ),
+        chunks: t.Optional(
+          t.Array(
+            t.Object({
+              id: t.Optional(t.String()),
+              start: t.Number(),
+              end: t.Number(),
+              text: t.Optional(t.String()),
+              words: t.Array(
+                t.Object({
+                  id: t.Optional(t.String()),
+                  text: t.Optional(t.String()),
+                  word: t.Optional(t.String()),
+                  start: t.Number(),
+                  end: t.Number(),
+                  cut: t.Optional(t.Boolean()),
+                  accent: t.Optional(t.Boolean()),
+                })
+              ),
+            })
+          )
+        ),
+        captionStyle: t.Optional(
+          t.Object({
+            fontFamily: t.Optional(t.String()),
+            fontSize: t.Optional(t.Number()),
+            allCaps: t.Optional(t.Boolean()),
+            color: t.Optional(t.String()),
+            primaryColor: t.Optional(t.String()),
+            accentColor: t.Optional(t.String()),
+          })
+        ),
       }),
     }
-  );
+  )
+  .get("/api/clips/render/:jobId", ({ params, set }) => {
+    const job = getJob(params.jobId);
+    if (!job) {
+      set.status = 404;
+      return { error: `Render job not found: ${params.jobId}` };
+    }
+    return {
+      jobId: job.jobId,
+      status: job.status,
+      progress: job.progress,
+      resultUrl: job.resultUrl,
+      error: job.error,
+    };
+  })
+  .get("/outputs/:filename", ({ params, set }) => {
+    const clean = sanitizeFileKey(params.filename);
+    const filePath = path.resolve(config.uploadsDir, clean);
+    if (!existsSync(filePath)) {
+      set.status = 404;
+      return { error: `File not found: ${clean}` };
+    }
+    const file = Bun.file(filePath);
+    return new Response(file, {
+      headers: {
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes",
+      },
+    });
+  });
 
 if (import.meta.main) {
   validateConfig();

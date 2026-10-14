@@ -52,11 +52,14 @@ export interface CustomFont {
 export interface RenderConfig {
 	layout: 'split' | 'fill';
 	cropX: number; // -100 s/d 100
-	status: 'idle' | 'rendering' | 'completed' | 'error';
+	status: 'idle' | 'queued' | 'processing' | 'done' | 'failed';
 	progress: number;
+	jobId?: string;
 	ffmpegPreview?: string;
 	error?: string;
 	resultUrl?: string;
+	duration?: number;
+	size?: number;
 }
 
 export type AspectRatioTarget = '9:16' | '1:1' | '16:9';

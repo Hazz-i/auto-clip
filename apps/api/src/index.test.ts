@@ -109,7 +109,7 @@ describe("Cliper API", () => {
     expect(found.size).toBe(fakeVideo.size);
   });
 
-  it("POST /api/clips/render returns queued preview command", async () => {
+  it("POST /api/clips/render queues an async render job", async () => {
     const res = await app.handle(
       new Request("http://localhost:3000/api/clips/render", {
         method: "POST",
@@ -122,11 +122,12 @@ describe("Cliper API", () => {
         }),
       })
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(202);
     const data = (await res.json()) as any;
     expect(data.status).toBe("queued");
-    expect(data.ffmpegPreview).toContain("ffmpeg");
-    expect(data.ffmpegPreview).toContain("crop=ih*9/16");
+    expect(typeof data.jobId).toBe("string");
+    expect(data.jobId.length).toBeGreaterThan(0);
+    expect(String(data.resultUrl)).toContain("/outputs/");
   });
 
   it("normalizeTranscription normalizes whisper verbose_json, Scribe, and fallbacks", () => {

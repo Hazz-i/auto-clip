@@ -8,6 +8,13 @@
 
 	const ffmpegCommand = $derived(cliperStore.generateFfmpegCommand());
 
+	const isRendering = $derived(
+		cliperStore.render.status === 'queued' || cliperStore.render.status === 'processing'
+	);
+
+	let videoDuration = $state<number | null>(null);
+	let videoResolution = $state<string | null>(null);
+
 	function removeCut(wordId: string) {
 		for (const chunk of cliperStore.chunks) {
 			const word = chunk.words.find((w) => w.id === wordId);
@@ -16,6 +23,30 @@
 				break;
 			}
 		}
+	}
+
+	function handleVideoMetadata(e: Event) {
+		const video = e.currentTarget as HTMLVideoElement;
+		if (video) {
+			if (video.duration && !Number.isNaN(video.duration)) {
+				videoDuration = video.duration;
+			}
+			if (video.videoWidth && video.videoHeight) {
+				videoResolution = `${video.videoWidth}×${video.videoHeight}`;
+			}
+		}
+	}
+
+	function formatBytes(bytes?: number): string {
+		if (!bytes || bytes <= 0) return '';
+		const units = ['B', 'KB', 'MB', 'GB'];
+		let val = bytes;
+		let i = 0;
+		while (val >= 1024 && i < units.length - 1) {
+			val /= 1024;
+			i++;
+		}
+		return `${val.toFixed(1)} ${units[i]}`;
 	}
 </script>
 
@@ -107,11 +138,25 @@
 	<div class="render-action-card">
 		<button
 			class="btn btn-primary w-full btn-lg"
-			disabled={cliperStore.render.status === 'rendering'}
+			disabled={isRendering}
 			onclick={() => cliperStore.sendRenderJob()}
 		>
-			{#if cliperStore.render.status === 'rendering'}
-				<span class="spinner-sm"></span> Merender Klip ({cliperStore.render.progress}%)
+			{#if cliperStore.render.status === 'queued'}
+				<span class="spinner-sm"></span>
+				<span>Menunggu Antrean ({cliperStore.render.progress}%)</span>
+			{:else if cliperStore.render.status === 'processing'}
+				<span class="spinner-sm"></span>
+				<span>Memproses Render ({cliperStore.render.progress}%)</span>
+			{:else if cliperStore.render.status === 'done'}
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+					<path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
+				</svg>
+				<span>Render Ulang (POST /api/clips/render)</span>
+			{:else if cliperStore.render.status === 'failed'}
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+					<path d="M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+				</svg>
+				<span>Coba Render Ulang (POST /api/clips/render)</span>
 			{:else}
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
 					<polygon points="5 3 19 12 5 21 5 3" fill="currentColor" />
@@ -120,19 +165,105 @@
 			{/if}
 		</button>
 
-		{#if cliperStore.render.status === 'rendering'}
-			<div class="progress-bar-container">
-				<div class="progress-bar-fill" style:width="{cliperStore.render.progress}%"></div>
+		{#if isRendering}
+			<div class="render-progress-card">
+				<div class="progress-meta-row">
+					<span class="progress-label">
+						{cliperStore.render.status === 'queued' ? 'Menunggu antrean worker...' : 'Memproses video & subtitle...'}
+					</span>
+					<span class="progress-val font-mono">{cliperStore.render.progress}%</span>
+				</div>
+				<div class="progress-bar-container">
+					<div class="progress-bar-fill" style:width="{cliperStore.render.progress}%"></div>
+				</div>
+				{#if cliperStore.render.jobId}
+					<span class="job-id-hint">Job ID: <code class="font-mono">{cliperStore.render.jobId}</code></span>
+				{/if}
 			</div>
 		{/if}
 
-		{#if cliperStore.render.status === 'completed'}
-			<div class="success-banner">
-				<span>Render berhasil diselesaikan!</span>
+		{#if cliperStore.render.status === 'failed' && cliperStore.render.error}
+			<div class="error-banner">
+				<div class="error-header">
+					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+						<circle cx="12" cy="12" r="10" />
+						<line x1="12" y1="8" x2="12" y2="12" />
+						<line x1="12" y1="16" x2="12.01" y2="16" />
+					</svg>
+					<span class="error-title">Render Gagal</span>
+				</div>
+				<p class="error-detail">{cliperStore.render.error}</p>
+			</div>
+		{/if}
+
+		{#if cliperStore.render.status === 'done'}
+			<div class="result-card">
+				<div class="result-header">
+					<span class="result-title">
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+							<polyline points="20 6 9 17 4 12" />
+						</svg>
+						Hasil Render Siap
+					</span>
+					<span class="badge-success">100% Selesai</span>
+				</div>
+
 				{#if cliperStore.render.resultUrl}
-					<a href={cliperStore.render.resultUrl} target="_blank" class="download-link">
-						Buka File Output
-					</a>
+					<div class="result-preview-box">
+						<!-- svelte-ignore a11y_media_has_caption -->
+						<video
+							src={cliperStore.render.resultUrl}
+							controls
+							playsinline
+							preload="metadata"
+							class="result-video-player"
+							onloadedmetadata={handleVideoMetadata}
+						></video>
+					</div>
+
+					<div class="result-meta-row">
+						{#if videoDuration !== null || cliperStore.render.duration}
+							<span class="meta-tag">
+								⏱ Durasi: {(videoDuration ?? cliperStore.render.duration)?.toFixed(1)}s
+							</span>
+						{/if}
+						{#if videoResolution}
+							<span class="meta-tag">
+								📐 {videoResolution}
+							</span>
+						{/if}
+						{#if cliperStore.render.size}
+							<span class="meta-tag">
+								💾 {formatBytes(cliperStore.render.size)}
+							</span>
+						{/if}
+					</div>
+
+					<div class="result-actions-row">
+						<a
+							href={cliperStore.render.resultUrl}
+							download="cliper-render.mp4"
+							target="_blank"
+							rel="noreferrer"
+							class="btn btn-primary download-btn"
+						>
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+								<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+								<polyline points="7 10 12 15 17 10" />
+								<line x1="12" y1="15" x2="12" y2="3" />
+							</svg>
+							<span>Download MP4</span>
+						</a>
+						<a
+							href={cliperStore.render.resultUrl}
+							target="_blank"
+							rel="noreferrer"
+							class="btn btn-secondary btn-sm"
+							title="Buka file video di tab baru"
+						>
+							Buka Tab Baru ↗
+						</a>
+					</div>
 				{/if}
 			</div>
 		{/if}
@@ -359,28 +490,6 @@
 		height: 100%;
 		background: linear-gradient(90deg, var(--accent-primary) 0%, var(--accent-emerald) 100%);
 		transition: width 0.3s ease;
-	}
-
-	.success-banner {
-		background: rgba(16, 185, 129, 0.12);
-		border: 1px solid rgba(16, 185, 129, 0.3);
-		color: var(--accent-emerald);
-		padding: 8px 12px;
-		border-radius: var(--radius-sm);
-		font-size: 12px;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-
-	.download-link {
-		color: #fff;
-		background: var(--accent-emerald);
-		padding: 2px 8px;
-		border-radius: 3px;
-		text-decoration: none;
-		font-weight: 700;
-		font-size: 11px;
 	}
 
 	.ffmpeg-preview-card {
