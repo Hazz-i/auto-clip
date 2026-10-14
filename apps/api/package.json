@@ -1,0 +1,24 @@
+{
+  "name": "@cliper/api",
+  "version": "0.1.0",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "run": "bun run"
+  },
+  "dependencies": {
+    "@cliper/core": "workspace:*",
+    "@elysiajs/cors": "^1.4.2",
+    "elysia": "^1.4.30"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.8.0"
+  }
+}

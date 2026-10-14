@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+
+# Storage & media
+uploads/
+*.mp3
+*.srt
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.wav
+*.m4a
+*.flac
+*.aac
+*.words.json
+
+# Large local fixtures / tooling caches
+source.mp4
+.opencode/
+
+# Cloudflare & secrets
+.wrangler/
+.dev.vars
+.env
+.env.*
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.log

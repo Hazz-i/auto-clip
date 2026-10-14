@@ -1,0 +1,17 @@
+# NineRouter AI Gateway
+NINEROUTER_BASE_URL=https://nine.hazz.biz.id/v1
+NINEROUTER_API_KEY=your_ninerouter_api_key_here
+
+# Model Selection
+CHAT_MODEL=anthropic/claude-3-5-sonnet-20241022
+STT_MODEL=el/scribe_v2
+
+# Storage Configuration (local | r2)
+STORAGE=local
+
+# Cloudflare R2 Credentials (required when STORAGE=r2)
+CF_ACCOUNT_ID=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+R2_BUCKET_NAME=cliper-media
+R2_PUBLIC_URL=

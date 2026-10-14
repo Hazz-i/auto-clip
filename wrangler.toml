@@ -1,0 +1,20 @@
+# Cloudflare Workers / Pages configuration stub for Cliper
+name = "cliper"
+main = "apps/api/src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database Binding
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "cliper-db"
+# database_id = "<your-d1-database-uuid>"
+
+# R2 Bucket Binding
+# [[r2_buckets]]
+# binding = "MEDIA_BUCKET"
+# bucket_name = "cliper-media"
+
+# Environment Variables Stub
+# [vars]
+# STORAGE = "local"

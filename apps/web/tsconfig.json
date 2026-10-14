@@ -1,0 +1,15 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		"skipLibCheck": true,
+		"types": ["bun", "$app/types"],
+		"paths": {
+			"#lib": ["./src/lib/index.ts"],
+			"#lib/*": ["./src/lib/*"],
+			"@cliper/core": ["../../packages/core/src/index.ts"],
+			"@cliper/core/*": ["../../packages/core/src/*"]
+		}
+	},
+	"include": ["src", "vite.config.ts"]
+}
