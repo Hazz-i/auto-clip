@@ -6,3 +6,4 @@ export * from './facetrack.js';
 export * from './storage.js';
 export * from './ai-config.js';
 export * from './ass.js';
+export * from './hook.js';

@@ -11,9 +11,20 @@ import type {
 	SubtitlePreset,
 	ClipRange
 } from '../types';
+import { mapSuggestedClips, type ClipRecommendation } from '../clip-recommendations';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const STORAGE_CUSTOM_FONTS_KEY = 'cliper_custom_fonts';
+const STORAGE_CAPTION_STYLE_KEY = 'cliper_caption_style_v1';
+
+// Alpha ASS untuk kotak latar render: 0x00 solid, 0xFF transparan (diturunkan dari alpha CSS di boxBg)
+function boxAlphaToAss(boxBg: string, enabled: boolean): number {
+	if (!enabled) return 255; // kotak nonaktif => alpha 255
+	const m = /rgba?\(([^)]+)\)/i.exec(boxBg || '');
+	const a = m ? parseFloat(m[1].split(/[\s,/]+/)[3] ?? '1') : boxBg ? 1 : 0;
+	const alpha = Number.isNaN(a) ? 1 : a;
+	return Math.max(0, Math.min(255, Math.round((1 - alpha) * 255)));
+}
 
 // Contoh data transkrip awal ala student-kit (1-3 kata/chunk, word-level sync)
 const INITIAL_CHUNKS: Chunk[] = [
@@ -162,6 +173,7 @@ export class CliperStore {
 	duration = $state<number>(10.5);
 	isPlaying = $state<boolean>(false);
 	videoElement = $state<HTMLVideoElement | null>(null);
+	setupComplete = $state(false);
 	uploadStatus = $state<'idle' | 'uploading' | 'done' | 'error'>('idle');
 	uploading = $state<boolean>(false);
 	uploadProgress = $state<number>(0);
@@ -173,7 +185,7 @@ export class CliperStore {
 	wizard = $state<WizardConfig>({
 		isOpen: false,
 		step: 1,
-		targetRatio: '9:16',
+		targetRatio: '16:9',
 		clipCount: 1,
 		clipRanges: [],
 		cropMode: 'auto',
@@ -188,6 +200,13 @@ export class CliperStore {
 	transcribeErrorMessage = $state<string | null>(null);
 	transcribeSuccessMessage = $state<string | null>(null);
 	hasRealTranscript = $state<boolean>(false);
+	// Status transkripsi per-scene (by id scene di suggestedClips)
+	sceneTranscribeStatus = $state<Record<string, 'loading' | 'error'>>({});
+	sceneTranscribeError = $state<Record<string, string | null>>({});
+	suggestedClips = $state<ClipRecommendation[]>([]);
+	suggestStatus = $state<'idle' | 'loading' | 'error'>('idle');
+	suggestErrorMessage = $state<string | null>(null);
+	private suggestedFileKey = '';
 
 	// Caption style (Abril Fatface default ala student-kit)
 	captionStyle = $state<CaptionStyle>({
@@ -196,8 +215,10 @@ export class CliperStore {
 		allCaps: true,
 		primaryColor: '#FFFFFF',
 		accentColor: '#FACC15',
+		boxEnabled: true,
 		boxBg: 'rgba(12, 16, 26, 0.88)',
 		boxBorder: 'rgba(255, 255, 255, 0.22)',
+		boxRadius: 6, // preview-only (CaptionText pakai rounded-[6px])
 		positionY: 72 // 72% dari atas: seam/dada (bukan dagu)
 	});
 
@@ -247,6 +268,43 @@ export class CliperStore {
 			}
 		} catch (err) {
 			console.error('Gagal baca localStorage:', err);
+		}
+	}
+
+	saveCaptionStyle(): boolean {
+		if (typeof localStorage === 'undefined') return false;
+		try {
+			localStorage.setItem(STORAGE_CAPTION_STYLE_KEY, JSON.stringify(this.captionStyle));
+			return true;
+		} catch (err) {
+			console.warn('Gagal simpan pengaturan caption:', err);
+			return false;
+		}
+	}
+
+	loadCaptionStyle() {
+		if (typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(STORAGE_CAPTION_STYLE_KEY);
+			if (!raw) return;
+			const stored: unknown = JSON.parse(raw);
+			if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return;
+			const value = stored as Record<string, unknown>;
+			const defaults = this.captionStyle;
+			this.captionStyle = {
+				fontFamily: typeof value.fontFamily === 'string' ? value.fontFamily : defaults.fontFamily,
+				fontSize: typeof value.fontSize === 'number' && Number.isFinite(value.fontSize) && value.fontSize >= 48 && value.fontSize <= 80 ? value.fontSize : defaults.fontSize,
+				allCaps: typeof value.allCaps === 'boolean' ? value.allCaps : defaults.allCaps,
+				primaryColor: typeof value.primaryColor === 'string' ? value.primaryColor : defaults.primaryColor,
+				accentColor: typeof value.accentColor === 'string' ? value.accentColor : defaults.accentColor,
+				boxEnabled: typeof value.boxEnabled === 'boolean' ? value.boxEnabled : defaults.boxEnabled,
+				boxBg: typeof value.boxBg === 'string' ? value.boxBg : defaults.boxBg,
+				boxBorder: typeof value.boxBorder === 'string' ? value.boxBorder : defaults.boxBorder,
+				boxRadius: typeof value.boxRadius === 'number' && Number.isFinite(value.boxRadius) && value.boxRadius >= 0 && value.boxRadius <= 24 ? value.boxRadius : defaults.boxRadius,
+				positionY: typeof value.positionY === 'number' && Number.isFinite(value.positionY) && value.positionY >= 5 && value.positionY <= 95 ? value.positionY : defaults.positionY
+			};
+		} catch (err) {
+			console.warn('Gagal baca pengaturan caption:', err);
 		}
 	}
 
@@ -333,6 +391,7 @@ export class CliperStore {
 	}
 
 	handleFileSelect(file: File) {
+		this.setupComplete = false;
 		this.videoFile = file;
 		this.fileKey = '';
 		this.uploadStatus = 'idle';
@@ -346,6 +405,28 @@ export class CliperStore {
 			URL.revokeObjectURL(this.videoUrl);
 		}
 		this.videoUrl = URL.createObjectURL(file);
+		const videoUrl = this.videoUrl;
+		const probe = document.createElement('video');
+		const cleanup = () => {
+			probe.removeEventListener('loadedmetadata', onLoadedMetadata);
+			probe.removeEventListener('error', cleanup);
+			probe.removeAttribute('src');
+			probe.load();
+		};
+		const onLoadedMetadata = () => {
+			if (this.videoFile === file) {
+				this.setVideoMetadata(
+					probe.videoWidth,
+					probe.videoHeight,
+					Number.isFinite(probe.duration) ? probe.duration : undefined
+				);
+			}
+			cleanup();
+		};
+		probe.preload = 'metadata';
+		probe.addEventListener('loadedmetadata', onLoadedMetadata);
+		probe.addEventListener('error', cleanup);
+		probe.src = videoUrl;
 	}
 
 	setVideoMetadata(width: number, height: number, duration?: number) {
@@ -369,7 +450,7 @@ export class CliperStore {
 		this.wizard.isOpen = false;
 	}
 
-	setWizardStep(step: 1 | 2 | 3 | 4) {
+	setWizardStep(step: 1 | 2 | 3) {
 		this.wizard.step = step;
 	}
 
@@ -439,6 +520,8 @@ export class CliperStore {
 				accentColor: '#FACC15',
 				boxBg: 'rgba(12, 16, 26, 0.88)',
 				boxBorder: '#FFFFFF',
+				boxEnabled: true,
+				boxRadius: 6,
 				positionY: 72
 			};
 		} else if (this.wizard.subtitlePreset === 'dark-box') {
@@ -451,6 +534,8 @@ export class CliperStore {
 				accentColor: '#38BDF8',
 				boxBg: 'rgba(0, 0, 0, 0.92)',
 				boxBorder: 'rgba(255, 255, 255, 0.22)',
+				boxEnabled: true,
+				boxRadius: 6,
 				positionY: 72
 			};
 		} else if (this.wizard.subtitlePreset === 'minimal') {
@@ -463,6 +548,8 @@ export class CliperStore {
 				accentColor: '#10B981',
 				boxBg: 'transparent',
 				boxBorder: 'transparent',
+				boxEnabled: false,
+				boxRadius: 0,
 				positionY: 75
 			};
 		}
@@ -489,33 +576,56 @@ export class CliperStore {
 			return null;
 		}
 
+		this.setupComplete = false;
 		this.uploadStatus = 'uploading';
 		this.uploading = true;
-		this.uploadProgress = 15;
+		this.uploadProgress = 0;
 		this.uploadStatusText = 'Mengupload…';
 		this.uploadError = null;
 
 		const targetUrl = `${this.apiUrl.replace(/\/$/, '')}/api/upload-direct`;
+		// Capture setelah guard: narrowing `this.videoFile` hilang di dalam closure.
+		const file = this.videoFile;
 
 		try {
-			const formData = new FormData();
-			formData.append('file', this.videoFile);
+			// ponytail: wajib XHR — fetch tidak memancarkan event progress upload, jadi progress tak bisa naik nyata.
+			const json = await new Promise<any>((resolve, reject) => {
+				const xhr = new XMLHttpRequest();
+				const formData = new FormData();
+				formData.append('file', file);
 
-			this.uploadProgress = 40;
+				xhr.open('POST', targetUrl);
+				xhr.timeout = 15 * 60 * 1000; // file besar (sampai 500MB) butuh waktu
 
-			const res = await fetch(targetUrl, {
-				method: 'POST',
-				body: formData
+				xhr.upload.onprogress = (e) => {
+					if (e.lengthComputable && e.total > 0) {
+						// simpan 100% untuk konfirmasi server; bila gagal progress tidak tampak "selesai"
+						this.uploadProgress = Math.min(99, Math.round((e.loaded / e.total) * 100));
+					}
+				};
+
+				xhr.onload = () => {
+					let parsed: any = null;
+					try {
+						parsed = JSON.parse(xhr.responseText || '{}');
+					} catch {
+						parsed = null;
+					}
+					if (xhr.status >= 200 && xhr.status < 300) {
+						if (parsed && typeof parsed === 'object') resolve(parsed);
+						else reject(new Error(`Respon backend tidak valid (HTTP ${xhr.status})`));
+					} else {
+						reject(new Error(parsed?.error || `Server respon: ${xhr.status} ${xhr.statusText}`));
+					}
+				};
+
+				xhr.onerror = () => reject(new Error('Koneksi ke server terputus saat upload'));
+				xhr.ontimeout = () => reject(new Error('Upload timeout: koneksi lambat atau server tidak merespon'));
+				xhr.onabort = () => reject(new Error('Upload dibatalkan'));
+
+				xhr.send(formData);
 			});
 
-			this.uploadProgress = 85;
-
-			if (!res.ok) {
-				const errJson = await res.json().catch(() => ({}));
-				throw new Error(errJson.error || `Server respon: ${res.status} ${res.statusText}`);
-			}
-
-			const json = await res.json().catch(() => ({}));
 			const serverKey = json.fileKey || json.key;
 			if (!serverKey) {
 				throw new Error('Respon backend tidak mengandung fileKey');
@@ -550,8 +660,81 @@ export class CliperStore {
 		}
 	}
 
-	// Transcript actions
-	async transcribeClip(language = 'id') {
+	// Parser shared: ubah objek transcript STT jadi chunks 3 kata (format student-kit).
+	// null bila tidak ada kata sama sekali.
+	private transcriptToChunks(transcript: any, idPrefix = 'stt'): Chunk[] | null {
+		const isEstimated = Boolean(transcript?.noTimestamps);
+		const newChunks: Chunk[] = [];
+
+		if (Array.isArray(transcript.chunks) && transcript.chunks.length > 0) {
+			for (let cIdx = 0; cIdx < transcript.chunks.length; cIdx++) {
+				const ch = transcript.chunks[cIdx];
+				const rawWords = Array.isArray(ch.words) ? ch.words : [];
+				const words: Word[] = rawWords.flatMap((w: any, wIdx: number) =>
+					splitAnomalousWord(
+						w.word || w.text || '',
+						Number(w.start) || 0,
+						Number(w.end) || 0,
+						`w-${idPrefix}-${cIdx}-${wIdx}`
+					)
+				);
+
+				if (words.length > 0) {
+					if (words.length > 3) {
+						for (let i = 0; i < words.length; i += 3) {
+							const slice = words.slice(i, i + 3);
+							newChunks.push({
+								id: `c-${idPrefix}-${cIdx}-${i}`,
+								start: slice[0].start,
+								end: slice[slice.length - 1].end,
+								text: slice.map((w) => w.text).join(' '),
+								words: slice,
+								estimated: isEstimated
+							});
+						}
+					} else {
+						newChunks.push({
+							id: `c-${idPrefix}-${cIdx}`,
+							start: Number(ch.start) || words[0].start,
+							end: Number(ch.end) || words[words.length - 1].end,
+							text: ch.text || words.map((w) => w.text).join(' '),
+							words,
+							estimated: isEstimated
+						});
+					}
+				}
+			}
+		}
+
+		if (newChunks.length === 0 && Array.isArray(transcript.words) && transcript.words.length > 0) {
+			const mappedWords: Word[] = transcript.words.flatMap((w: any, idx: number) =>
+				splitAnomalousWord(
+					w.word || w.text || '',
+					Number(w.start) || 0,
+					Number(w.end) || 0,
+					`w-${idPrefix}-${idx}`
+				)
+			);
+
+			// Kelompokkan 3 kata per chunk (format student-kit)
+			for (let i = 0; i < mappedWords.length; i += 3) {
+				const slice = mappedWords.slice(i, i + 3);
+				newChunks.push({
+					id: `c-${idPrefix}-${i}`,
+					start: slice[0].start,
+					end: slice[slice.length - 1].end,
+					text: slice.map((w) => w.text).join(' '),
+					words: slice,
+					estimated: isEstimated
+				});
+			}
+		}
+
+		return newChunks.length > 0 ? newChunks : null;
+	}
+
+	// Transkrip SELURUH video (path utama); transcribeClip adalah alias untuk kompatibilitas
+	async transcribeAll(language = 'id'): Promise<void> {
 		if (this.uploadStatus !== 'done' || !this.fileKey || !this.apiUrl || this.transcribeStatus === 'loading') {
 			return;
 		}
@@ -581,87 +764,162 @@ export class CliperStore {
 				throw new Error('Respon backend tidak memiliki objek transcript');
 			}
 
-			const isEstimated = Boolean(transcript.noTimestamps);
-			let newChunks: Chunk[] = [];
-
-			if (Array.isArray(transcript.chunks) && transcript.chunks.length > 0) {
-				for (let cIdx = 0; cIdx < transcript.chunks.length; cIdx++) {
-					const ch = transcript.chunks[cIdx];
-					const rawWords = Array.isArray(ch.words) ? ch.words : [];
-					const words: Word[] = rawWords.flatMap((w: any, wIdx: number) =>
-						splitAnomalousWord(
-							w.word || w.text || '',
-							Number(w.start) || 0,
-							Number(w.end) || 0,
-							`w-stt-${cIdx}-${wIdx}`
-						)
-					);
-
-					if (words.length > 0) {
-						if (words.length > 3) {
-							for (let i = 0; i < words.length; i += 3) {
-								const slice = words.slice(i, i + 3);
-								newChunks.push({
-									id: `c-stt-${cIdx}-${i}`,
-									start: slice[0].start,
-									end: slice[slice.length - 1].end,
-									text: slice.map((w) => w.text).join(' '),
-									words: slice,
-									estimated: isEstimated
-								});
-							}
-						} else {
-							newChunks.push({
-								id: `c-stt-${cIdx}`,
-								start: Number(ch.start) || words[0].start,
-								end: Number(ch.end) || words[words.length - 1].end,
-								text: ch.text || words.map((w) => w.text).join(' '),
-								words,
-								estimated: isEstimated
-							});
-						}
-					}
-				}
-			}
-
-			if (newChunks.length === 0 && Array.isArray(transcript.words) && transcript.words.length > 0) {
-				const mappedWords: Word[] = transcript.words.flatMap((w: any, idx: number) =>
-					splitAnomalousWord(
-						w.word || w.text || '',
-						Number(w.start) || 0,
-						Number(w.end) || 0,
-						`w-stt-${idx}`
-					)
-				);
-
-				// Kelompokkan 3 kata per chunk (format student-kit)
-				for (let i = 0; i < mappedWords.length; i += 3) {
-					const slice = mappedWords.slice(i, i + 3);
-					newChunks.push({
-						id: `c-stt-${i}`,
-						start: slice[0].start,
-						end: slice[slice.length - 1].end,
-						text: slice.map((w) => w.text).join(' '),
-						words: slice,
-						estimated: isEstimated
-					});
-				}
-			}
-
-			if (newChunks.length > 0) {
-				this.chunks = newChunks;
-				this.hasRealTranscript = true;
-				this.transcribeStatus = 'idle';
-				const totalWords = newChunks.reduce((acc, c) => acc + c.words.length, 0);
-				this.transcribeSuccessMessage = `Transkrip masuk: ${totalWords} kata`;
-				this.activeTab = 'transcript';
-			} else {
+			const newChunks = this.transcriptToChunks(transcript);
+			if (!newChunks) {
 				throw new Error('Hasil transkrip kosong / tidak ada kata terdeteksi');
 			}
+
+			this.chunks = newChunks;
+			this.hasRealTranscript = true;
+			this.transcribeStatus = 'idle';
+			const totalWords = newChunks.reduce((acc, c) => acc + c.words.length, 0);
+			this.transcribeSuccessMessage = `Transkrip masuk: ${totalWords} kata`;
+			this.activeTab = 'transcript';
 		} catch (err: any) {
 			this.transcribeStatus = 'error';
 			this.transcribeErrorMessage = err.message || 'Gagal memanggil endpoint STT transkripsi';
 		}
+	}
+
+	// Alias path lama (seluruh video) — delegasi ke transcribeAll agar tidak duplikasi kode
+	async transcribeClip(language = 'id'): Promise<void> {
+		await this.transcribeAll(language);
+	}
+
+	// Transkripsi hanya rentang waktu satu scene; hasil digabung ke chunks berdasarkan overlap waktu.
+	// Gagal pada satu scene TIDAK menyentuh status scene lain maupun status global.
+	async transcribeScene(sceneId: string): Promise<void> {
+		if (this.uploadStatus !== 'done' || !this.fileKey || !this.apiUrl) return;
+		if (this.sceneTranscribeStatus[sceneId] === 'loading') return;
+
+		const scene = this.suggestedClips.find((c) => c.id === sceneId);
+		if (!scene) return;
+
+		this.sceneTranscribeStatus = { ...this.sceneTranscribeStatus, [sceneId]: 'loading' };
+		this.sceneTranscribeError = { ...this.sceneTranscribeError, [sceneId]: null };
+
+		try {
+			const res = await fetch(`${this.apiUrl.replace(/\/$/, '')}/api/clips/transcribe`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					fileKey: this.fileKey,
+					start: scene.start,
+					end: scene.end
+				})
+			});
+
+			if (!res.ok) {
+				const errJson = await res.json().catch(() => ({}));
+				throw new Error(errJson.error || `Server merespon ${res.status}: ${res.statusText}`);
+			}
+
+			const data = await res.json().catch(() => ({}));
+			const transcript = data.transcript;
+			if (!transcript) {
+				throw new Error('Respon backend tidak memiliki objek transcript');
+			}
+
+			const newChunks = this.transcriptToChunks(transcript, `scene-${sceneId}`);
+			if (!newChunks) {
+				throw new Error('Hasil transkrip kosong / tidak ada kata terdeteksi');
+			}
+
+			// Merge by overlap: buang chunk lama yang beririsan dengan scene, sisipkan chunk baru,
+			// sisanya dipertahankan, urutkan kembali by start. INITIAL_CHUNKS (data demo) tidak ikut digabung.
+			const existing = this.hasRealTranscript ? this.chunks : [];
+			const kept = existing.filter((c) => c.start >= scene.end || c.end <= scene.start);
+			this.chunks = [...kept, ...newChunks].sort((a, b) => a.start - b.start);
+			this.hasRealTranscript = true;
+			this.transcribeStatus = 'idle';
+
+			// Sukses: bersihkan entri status/error scene ini saja
+			const nextStatus = { ...this.sceneTranscribeStatus };
+			delete nextStatus[sceneId];
+			const nextError = { ...this.sceneTranscribeError };
+			delete nextError[sceneId];
+			this.sceneTranscribeStatus = nextStatus;
+			this.sceneTranscribeError = nextError;
+		} catch (err: any) {
+			this.sceneTranscribeStatus = { ...this.sceneTranscribeStatus, [sceneId]: 'error' };
+			this.sceneTranscribeError = {
+				...this.sceneTranscribeError,
+				[sceneId]: err.message || 'Gagal transkripsi scene'
+			};
+		}
+	}
+
+	async suggestClips(): Promise<void> {
+		if (!this.fileKey || this.uploadStatus !== 'done' || this.suggestStatus === 'loading') return;
+		if (this.suggestedFileKey === this.fileKey && this.suggestStatus === 'idle') return;
+
+		this.suggestStatus = 'loading';
+		this.suggestErrorMessage = null;
+		try {
+			const response = await fetch(`${this.apiUrl.replace(/\/$/, '')}/api/clips/suggest`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ fileKey: this.fileKey })
+			});
+			if (!response.ok) {
+				const body = await response.json().catch(() => ({}));
+				throw new Error(body.error || `Server merespon ${response.status}: ${response.statusText}`);
+			}
+
+			const data = await response.json().catch(() => ({}));
+			if (typeof data.duration === 'number' && data.duration > 0) this.duration = data.duration;
+			this.suggestedClips = mapSuggestedClips(data, this.duration);
+			this.suggestedFileKey = this.fileKey;
+			this.suggestStatus = 'idle';
+		} catch (error) {
+			this.suggestedClips = [];
+			this.suggestErrorMessage = error instanceof Error ? error.message : 'Gagal mengambil scene';
+			this.suggestStatus = 'error';
+		}
+	}
+
+	// Buang upload aktif: hapus file di server lalu reset seluruh state upload & analisis
+	// ke kondisi kosong. Aman dipanggil saat belum ada video terunggah (tidak pernah throw).
+	async discardUpload(): Promise<void> {
+		this.setupComplete = false;
+		if (this.fileKey) {
+			try {
+				await fetch(`${this.apiUrl.replace(/\/$/, '')}/api/clips/delete`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ fileKey: this.fileKey })
+				});
+			} catch {
+				// Gagal hapus di server tetap reset state lokal (endpoint server bersifat idempotent)
+			}
+		}
+
+		if (this.videoUrl && this.videoUrl.startsWith('blob:')) {
+			URL.revokeObjectURL(this.videoUrl);
+		}
+
+		this.videoFile = null;
+		this.fileKey = '';
+		this.videoUrl = '';
+		this.uploadStatus = 'idle';
+		this.uploadProgress = 0;
+		this.uploadSuccess = false;
+		this.uploadStatusText = '';
+		this.uploadError = null;
+		this.chunks = INITIAL_CHUNKS.map((c) => ({ ...c, words: c.words.map((w) => ({ ...w })) }));
+		this.hasRealTranscript = false;
+		this.suggestedClips = [];
+		this.suggestedFileKey = '';
+		this.suggestStatus = 'idle';
+		this.suggestErrorMessage = null;
+		this.transcribeStatus = 'idle';
+		this.transcribeErrorMessage = null;
+		this.transcribeSuccessMessage = null;
+		this.sceneTranscribeStatus = {};
+		this.sceneTranscribeError = {};
+		this.currentTime = 0;
+		this.isPlaying = false;
+		this.wizard.isOpen = false;
 	}
 
 	updateWordText(chunkId: string, wordId: string, newText: string) {
@@ -962,7 +1220,10 @@ export class CliperStore {
 				fontSize: this.captionStyle.fontSize,
 				allCaps: this.captionStyle.allCaps,
 				color: this.captionStyle.primaryColor,
-				accentColor: this.captionStyle.accentColor
+				accentColor: this.captionStyle.accentColor,
+				// boxRadius preview-only, tidak ikut render (ASS tak bisa kotak membulat)
+				boxBg: this.captionStyle.boxBg,
+				boxAlpha: boxAlphaToAss(this.captionStyle.boxBg, this.captionStyle.boxEnabled)
 			}
 		};
 

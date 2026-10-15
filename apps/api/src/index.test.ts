@@ -323,6 +323,42 @@ describe("Cliper API", () => {
     expect(Array.isArray(data.files)).toBe(true);
   });
 
+  it("POST /api/clips/suggest returns 404 with clear message on missing file", async () => {
+    const res = await app.handle(
+      new Request("http://localhost:3000/api/clips/suggest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileKey: "definitely-missing-hook.mp4" }),
+      })
+    );
+    expect(res.status).toBe(404);
+    const data = (await res.json()) as any;
+    expect(data.error).toContain("definitely-missing-hook.mp4");
+    expect(data.error).toContain(config.uploadsDir);
+  });
+
+  it("POST /api/clips/suggest returns 4xx when file is not a video", async () => {
+    const notVideoPath = path.resolve(config.uploadsDir, "not-a-video-hook.txt");
+    await Bun.write(notVideoPath, "ini bukan video sama sekali");
+    try {
+      const res = await app.handle(
+        new Request("http://localhost:3000/api/clips/suggest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileKey: "not-a-video-hook.txt" }),
+        })
+      );
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      const data = (await res.json()) as any;
+      expect(typeof data.error).toBe("string");
+    } finally {
+      try {
+        unlinkSync(notVideoPath);
+      } catch {}
+    }
+  });
+
   it("POST /api/clips/transcribe returns 404 with clear path on missing file", async () => {
     const res = await app.handle(
       new Request("http://localhost:3000/api/clips/transcribe", {

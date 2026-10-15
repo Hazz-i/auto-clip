@@ -109,4 +109,51 @@ describe('ass karaoke builder', () => {
     // Word 4: { } escaped to ( )
     expect(ass).toContain('{\\k80}(SPESIAL)');
   });
+
+  it('leaves output byte-identical when no box fields are set', () => {
+    const build = (extraStyle: Record<string, unknown> = {}) =>
+      buildAss({
+        chunks: [],
+        width: 1080,
+        height: 1920,
+        style: { fontFamily: 'Montserrat', fontSize: 64, color: '#FFFFFF', ...extraStyle },
+      });
+
+    const expectedPlainLine =
+      'Style: Default,Montserrat,64,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,2,10,10,288,1';
+
+    // tanpa semua field box: output sama persis seperti sebelum fitur ini ada
+    expect(build()).toContain(expectedPlainLine);
+
+    // boxEnabled=false di web dikirim sbg boxAlpha 255 (transparan penuh) => kotak tidak digambar
+    const disabled = build({ boxBg: 'rgba(12, 16, 26, 0.88)', boxAlpha: 255 });
+    expect(disabled).toContain(expectedPlainLine);
+
+    // boxBg tak valid sama sekali => tanpa kotak
+    expect(build({ boxBg: 'bukan-warna' })).toContain(expectedPlainLine);
+    expect(build({ boxBg: 'transparent' })).toContain(expectedPlainLine);
+  });
+
+  it('paints BorderStyle=3 box via OutlineColour with derived ASS alpha', () => {
+    const ass = buildAss({
+      chunks: [],
+      width: 1080,
+      height: 1920,
+      style: { boxBg: 'rgba(12, 16, 26, 0.88)' },
+    });
+
+    // alpha CSS 0.88 => ASS alpha 31 (0x1F); warna rgba(12,16,26) => #0C101A => BGR 1A100C
+    expect(ass).toContain('&H1F1A100C'); // OutlineColour = warna kotak + alpha
+    expect(ass).toContain('-1,0,0,0,100,100,0,0,3,3,0,2,10,10,288,1'); // BorderStyle=3
+
+    // hex #0C101A dengan alpha eksplisit 0 (opaque) => &H001A100C
+    const solid = buildAss({
+      chunks: [],
+      width: 1080,
+      height: 1920,
+      style: { boxBg: '#0C101A', boxAlpha: 0 },
+    });
+    expect(solid).toContain('&H001A100C');
+    expect(solid).toContain('-1,0,0,0,100,100,0,0,3,3,0,2,10,10,288,1');
+  });
 });

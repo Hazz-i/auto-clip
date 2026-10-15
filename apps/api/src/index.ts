@@ -6,8 +6,9 @@ import { readdir, stat } from "fs/promises";
 import { config, getMaskedAiConfig, updateAiConfig, validateConfig } from "./config.ts";
 import { transcribe } from "./services/ninerouter.ts";
 import { transcribeElevenLabs } from "./services/elevenlabs.ts";
-import { buildRenderCommand, convertToMp3, detectSpeechSegments } from "./services/ffmpeg.ts";
+import { buildRenderCommand, convertToMp3, cutAudio, detectSpeechSegments } from "./services/ffmpeg.ts";
 import { createJob, getJob, runRender } from "./services/render.ts";
+import { suggestHooks } from "./services/hook.ts";
 import type { SpeechSegment, TranscriptResult, VideoLayout } from "./types.ts";
 import {
   chunksToSrt,
@@ -52,6 +53,28 @@ export function findUploadedFile(filename: string): string | null {
     if (existsSync(cand)) return cand;
   }
   return null;
+}
+
+/**
+ * Geser seluruh timestamp hasil STT (words, chunks, speechSegments) dari waktu slice
+ * ke waktu video absolut (range mode transkripsi parsial)
+ */
+export function offsetTranscript(transcript: TranscriptResult, offset: number): TranscriptResult {
+  const offsetWord = (w: Word) => ({ ...w, start: (w.start || 0) + offset, end: (w.end || 0) + offset });
+  return {
+    ...transcript,
+    words: (transcript.words || []).map(offsetWord),
+    chunks: transcript.chunks?.map((ch) => ({
+      ...ch,
+      start: (ch.start || 0) + offset,
+      end: (ch.end || 0) + offset,
+      words: (ch.words || []).map(offsetWord),
+    })),
+    speechSegments: transcript.speechSegments?.map((s) => ({
+      start: s.start + offset,
+      end: s.end + offset,
+    })),
+  };
 }
 
 // Fast CLI health check support for verification
@@ -321,61 +344,221 @@ export const app = new Elysia({
         console.warn(`[Transcribe] ffprobe duration probe failed for ${cleanKey}, proceeding without duration:`, err);
       }
 
-      // Detect speech segments via VAD (silencedetect)
-      let speechSegments: SpeechSegment[] | undefined;
-      try {
-        const detected = await detectSpeechSegments(mp3Path, duration);
-        if (detected && detected.length > 0) {
-          speechSegments = detected;
-          console.log(`[Transcribe] Detected ${speechSegments.length} speech segments for ${cleanKey}`);
-        }
-      } catch (err) {
-        console.warn(`[Transcribe] detectSpeechSegments failed for ${cleanKey}, proceeding without segments:`, err);
-      }
+      // Range transkripsi parsial: potong slice mp3 lalu STT pada slice,
+      // timestamp respons digeser kembali ke waktu video absolut
+      const hasRange = body.start !== undefined || body.end !== undefined;
+      let sliceDuration: number | undefined; // durasi audio yang di-STT
+      let timeOffset = 0; // offset waktu slice -> waktu video absolut
+      let sttAudioPath = mp3Path;
+      let sttAudioName = mp3FileName;
+      let slicePath: string | null = null;
 
-      // Transcribe via selected provider
-      let transcript: TranscriptResult;
-      const audioBuffer = await Bun.file(mp3Path).arrayBuffer();
-      const audioBytes = new Uint8Array(audioBuffer);
-
-      if (config.sttProvider === "elevenlabs") {
-        if (!config.elevenlabsApiKey || !config.elevenlabsApiKey.trim()) {
+      if (hasRange) {
+        if (body.start === undefined || body.end === undefined) {
           set.status = 400;
-          return { error: "set ELEVENLABS_API_KEY di apps/api/.env lalu restart" };
+          return { error: "Range tidak valid: kirim start DAN end (detik, absolut video)" };
         }
-        console.log(`[Transcribe] Using direct ElevenLabs STT provider (model: ${config.elevenlabsSttModel})`);
-        transcript = await transcribeElevenLabs(audioBytes, {
-          language,
-          filename: mp3FileName,
-          duration,
-          speechSegments,
-          apiKey: config.elevenlabsApiKey,
-          model: config.elevenlabsSttModel,
-        });
-      } else {
-        console.log(`[Transcribe] Using proxy STT provider (model: ${config.sttModel})`);
-        transcript = await transcribe(audioBytes, {
-          language,
-          filename: mp3FileName,
-          duration,
-          speechSegments,
-        });
+        if (
+          !Number.isFinite(body.start) ||
+          !Number.isFinite(body.end) ||
+          body.start < 0 ||
+          body.end <= body.start
+        ) {
+          set.status = 400;
+          return { error: "Range tidak valid: start/end harus angka >= 0 dengan end > start" };
+        }
+        if (!duration || duration <= 0) {
+          set.status = 422;
+          return { error: "Gagal menentukan durasi video: range transkripsi parsial tidak bisa dipakai" };
+        }
+
+        // Clamp range ke [0, duration]
+        const clampedStart = Math.min(Math.max(body.start, 0), duration);
+        const clampedEnd = Math.min(Math.max(body.end, 0), duration);
+        if (clampedEnd - clampedStart <= 0) {
+          set.status = 400;
+          return { error: "Range di luar durasi video" };
+        }
+
+        sliceDuration = clampedEnd - clampedStart;
+        timeOffset = clampedStart;
+        slicePath = path.resolve(
+          config.uploadsDir,
+          `${cleanKey}.${clampedStart.toFixed(2)}-${clampedEnd.toFixed(2)}.mp3`
+        );
+        sttAudioPath = slicePath;
+        sttAudioName = path.basename(slicePath);
+
+        console.log(`[Transcribe] Range mode: ${clampedStart.toFixed(2)}-${clampedEnd.toFixed(2)}s -> ${sttAudioName}`);
+        await cutAudio(mp3Path, slicePath, clampedStart, clampedEnd);
       }
 
-      // Save transcript to local JSON
-      // ponytail: Storing transcript to local json. Ceiling: local dev. Upgrade path: Cloudflare D1.
-      const wordsPath = path.resolve(config.uploadsDir, `${cleanKey}.words.json`);
-      writeFileSync(wordsPath, JSON.stringify(transcript, null, 2));
+      try {
+        // Detect speech segments via VAD (silencedetect) — relatif terhadap audio yang di-STT
+        let speechSegments: SpeechSegment[] | undefined;
+        try {
+          const detected = await detectSpeechSegments(sttAudioPath, sliceDuration ?? duration);
+          if (detected && detected.length > 0) {
+            speechSegments = detected;
+            console.log(`[Transcribe] Detected ${speechSegments.length} speech segments for ${cleanKey}`);
+          }
+        } catch (err) {
+          console.warn(`[Transcribe] detectSpeechSegments failed for ${cleanKey}, proceeding without segments:`, err);
+        }
 
-      return {
-        clipId: cleanKey,
-        transcript,
-      };
+        // Transcribe via selected provider
+        let transcript: TranscriptResult;
+        const audioBuffer = await Bun.file(sttAudioPath).arrayBuffer();
+        const audioBytes = new Uint8Array(audioBuffer);
+
+        if (config.sttProvider === "elevenlabs") {
+          if (!config.elevenlabsApiKey || !config.elevenlabsApiKey.trim()) {
+            set.status = 400;
+            return { error: "set ELEVENLABS_API_KEY di apps/api/.env lalu restart" };
+          }
+          console.log(`[Transcribe] Using direct ElevenLabs STT provider (model: ${config.elevenlabsSttModel})`);
+          transcript = await transcribeElevenLabs(audioBytes, {
+            language,
+            filename: sttAudioName,
+            duration: sliceDuration ?? duration,
+            speechSegments,
+            apiKey: config.elevenlabsApiKey,
+            model: config.elevenlabsSttModel,
+          });
+        } else {
+          console.log(`[Transcribe] Using proxy STT provider (model: ${config.sttModel})`);
+          transcript = await transcribe(audioBytes, {
+            language,
+            filename: sttAudioName,
+            duration: sliceDuration ?? duration,
+            speechSegments,
+          });
+        }
+
+        // Geser timestamp hasil STT dari waktu slice ke waktu video absolut (hanya range mode)
+        if (timeOffset > 0) {
+          transcript = offsetTranscript(transcript, timeOffset);
+        }
+
+        // Save transcript to local JSON
+        // ponytail: Storing transcript to local json. Ceiling: local dev. Upgrade path: Cloudflare D1.
+        const wordsPath = path.resolve(config.uploadsDir, `${cleanKey}.words.json`);
+        writeFileSync(wordsPath, JSON.stringify(transcript, null, 2));
+
+        return {
+          clipId: cleanKey,
+          transcript,
+        };
+      } finally {
+        // Hapus slice sementara agar tidak menumpuk di uploadsDir
+        if (slicePath) {
+          try {
+            unlinkSync(slicePath);
+          } catch {
+            // abaikan kegagalan hapus slice
+          }
+        }
+      }
     },
     {
       body: t.Object({
         fileKey: t.String(),
         language: t.Optional(t.String()),
+        start: t.Optional(t.Number()),
+        end: t.Optional(t.Number()),
+      }),
+    }
+  )
+  .post(
+    "/api/clips/delete",
+    async ({ body, set }) => {
+      const cleanKey = sanitizeFileKey(body.fileKey);
+      if (!cleanKey) {
+        set.status = 400;
+        return { ok: false, error: "Invalid fileKey" };
+      }
+
+      const deleted: string[] = [];
+
+      // Hapus file video asli (bila ada) via resolver yang aman dari path traversal
+      const videoPath = findUploadedFile(cleanKey);
+      if (videoPath) {
+        try {
+          unlinkSync(videoPath);
+          deleted.push(cleanKey);
+        } catch (err) {
+          console.warn(`[Delete] Gagal hapus video ${videoPath}:`, err);
+        }
+      }
+
+      // Hapus artifact transkripsi di uploadsDir (bila ada). Rendered output
+      // ({key}.rendered.*.mp4) sengaja TIDAK ikut dihapus karena itu hasil render.
+      for (const suffix of [".mp3", ".words.json"]) {
+        const artPath = path.resolve(config.uploadsDir, `${cleanKey}${suffix}`);
+        if (existsSync(artPath)) {
+          try {
+            unlinkSync(artPath);
+            deleted.push(`${cleanKey}${suffix}`);
+          } catch (err) {
+            console.warn(`[Delete] Gagal hapus artifact ${artPath}:`, err);
+          }
+        }
+      }
+
+      console.log(`[Delete] ${cleanKey}: ${deleted.length} file dihapus`);
+      return { ok: true, deleted };
+    },
+    {
+      body: t.Object({
+        fileKey: t.String(),
+      }),
+    }
+  )
+  .post(
+    "/api/clips/suggest",
+    async ({ body, set }) => {
+      const cleanKey = sanitizeFileKey(body.fileKey);
+      if (!cleanKey) {
+        set.status = 400;
+        return { error: "Invalid fileKey" };
+      }
+
+      const videoPath = findUploadedFile(cleanKey);
+      if (!videoPath) {
+        set.status = 404;
+        return { error: `File not found: ${cleanKey} in ${config.uploadsDir}` };
+      }
+
+      // Validasi: file harus video (punya stream video & durasi)
+      let probed: Awaited<ReturnType<typeof probe>> | null = null;
+      try {
+        probed = await probe(videoPath);
+      } catch {
+        set.status = 422;
+        return { error: `Not a readable video: ${cleanKey}` };
+      }
+      if (!probed || probed.width <= 0 || probed.height <= 0) {
+        set.status = 422;
+        return { error: `Not a video file (no video stream): ${cleanKey}` };
+      }
+      if (!probed.duration || probed.duration <= 0) {
+        set.status = 422;
+        return { error: `Could not determine video duration: ${cleanKey}` };
+      }
+
+      try {
+        const result = await suggestHooks(videoPath);
+        console.log(`[Suggest] ${cleanKey}: ${result.clips.length} hook(s) dari ${result.duration}s`);
+        return result;
+      } catch (err) {
+        console.error(`[Suggest] failed for ${cleanKey}:`, err);
+        set.status = 500;
+        return { error: `Hook analysis failed: ${(err as Error).message}` };
+      }
+    },
+    {
+      body: t.Object({
+        fileKey: t.String(),
       }),
     }
   )
@@ -506,6 +689,8 @@ export const app = new Elysia({
             color: t.Optional(t.String()),
             primaryColor: t.Optional(t.String()),
             accentColor: t.Optional(t.String()),
+            boxBg: t.Optional(t.String()),
+            boxAlpha: t.Optional(t.Number()),
           })
         ),
       }),

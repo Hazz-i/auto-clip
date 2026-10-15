@@ -40,6 +40,8 @@ export interface CaptionStyle {
 	accentColor: string;
 	boxBg: string;
 	boxBorder: string;
+	boxEnabled: boolean; // apakah blok caption punya kotak latar (false = tanpa latar & border)
+	boxRadius: number; // radius sudut px — PREVIEW SAJA (ASS tidak bisa kotak membulat)
 	positionY: number; // persen vertikal, default 70% (posisi dada/seam)
 }
 
@@ -74,7 +76,7 @@ export interface ClipRange {
 
 export interface WizardConfig {
 	isOpen: boolean;
-	step: 1 | 2 | 3 | 4;
+	step: 1 | 2 | 3;
 	targetRatio: AspectRatioTarget;
 	clipCount: number;
 	clipRanges: ClipRange[];

@@ -23,6 +23,10 @@ export interface AssCaptionStyle {
   color?: string;
   primaryColor?: string;
   accentColor?: string;
+  /** Warna kotak latar caption: hex (#RRGGBB/#RGB) atau CSS rgb()/rgba() (BorderStyle=3, preview-only radius TIDAK dikirim) */
+  boxBg?: string;
+  /** Alpha kotak dalam format ASS langsung (00 opaque s/d FF/255 transparan); kalau kosong, diturunkan dari alpha rgba() di boxBg */
+  boxAlpha?: number;
 }
 
 export interface BuildAssOptions {
@@ -55,6 +59,39 @@ export function hexToAssColor(hex?: string, alpha = 0): string {
     .toString(16)
     .padStart(2, '0');
   return `&H${aHex}${b}${g}${r}`.toUpperCase();
+}
+
+/**
+ * Parse warna CSS (hex atau rgb()/rgba()) jadi { hex, alpha } (alpha 0-1) untuk kotak latar.
+ * 'transparent'/tidak valid => null (tanpa kotak).
+ */
+export function parseCssColor(css?: string): { hex: string; alpha: number } | null {
+  if (!css || typeof css !== 'string') return null;
+  const s = css.trim();
+  if (s.toLowerCase() === 'transparent' || s.toLowerCase() === 'none') return null;
+
+  const rgba = s.match(/^rgba?\(([^)]+)\)$/i);
+  if (rgba?.[1]) {
+    const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
+    const rgbNums: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const n = parseFloat(parts[i] ?? '');
+      if (Number.isNaN(n)) return null;
+      rgbNums.push(n);
+    }
+    const a = parts.length > 3 ? parseFloat(parts[3] ?? '') : 1;
+    const hex =
+      '#' +
+      rgbNums
+        .map((n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0'))
+        .join('');
+    return { hex, alpha: Number.isNaN(a) ? 1 : a };
+  }
+
+  const clean = s.replace(/^#/, '').trim();
+  // catatan: #RRGGBBAA tidak didukung oleh hexToAssColor (abaikan 2 digit akhir), ajukan alpha eksplisit
+  if (clean.length === 3 || clean.length === 6) return { hex: '#' + clean, alpha: 1 };
+  return null;
 }
 
 /**
@@ -114,6 +151,24 @@ export function buildAss(options: BuildAssOptions): string {
   const primaryTagColor = hexToAssTagColor(rawPrimary);
   const accentTagColor = hexToAssTagColor(rawAccent);
 
+  // Kotak latar (BorderStyle=3): spesifikasi ASS menaruh kotak di OutlineColour (verif. libass ass_render.c),
+  // BackColour hanya dipakai untuk shadow. boxAlpha = alpha ASS langsung (00 opaque, FF transparan);
+  // kalau tidak ada, diturunkan dari alpha rgba() di boxBg. Alpha ≥ 255 => tanpa kotak (BorderStyle tetap 1,
+  // agar outline teks tetap digambar).
+  let boxBorderStyle = 1;
+  let boxOutlineColour = '&H00000000';
+  const boxColor = parseCssColor(style.boxBg);
+  if (boxColor) {
+    const assAlpha = Math.max(
+      0,
+      Math.min(255, Math.round(style.boxAlpha ?? (1 - boxColor.alpha) * 255))
+    );
+    if (assAlpha < 255) {
+      boxBorderStyle = 3;
+      boxOutlineColour = hexToAssColor(boxColor.hex, assAlpha);
+    }
+  }
+
   // MarginV at ~15% of height (e.g. 288 for 1920) so captions sit on chest level
   const marginV = Math.round(height * 0.15);
 
@@ -126,7 +181,7 @@ export function buildAss(options: BuildAssOptions): string {
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    `Style: Default,${fontFamily},${fontSize},${primaryAssColor},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,2,10,10,${marginV},1`,
+    `Style: Default,${fontFamily},${fontSize},${primaryAssColor},&H000000FF,${boxOutlineColour},&H00000000,-1,0,0,0,100,100,0,0,${boxBorderStyle},3,0,2,10,10,${marginV},1`,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',

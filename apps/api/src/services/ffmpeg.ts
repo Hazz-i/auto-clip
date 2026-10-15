@@ -33,6 +33,50 @@ export async function convertToMp3(inputVideoPath: string, outputAudioPath: stri
   return outputAudioPath;
 }
 
+/**
+ * Potong audio (mp3) menjadi slice [startSec, endSec] detik dengan satu panggilan ffmpeg
+ */
+export async function cutAudio(
+  inputAudioPath: string,
+  outputAudioPath: string,
+  startSec: number,
+  endSec: number
+): Promise<string> {
+  const proc = Bun.spawn([
+    "ffmpeg",
+    "-y",
+    "-i",
+    inputAudioPath,
+    "-ss",
+    String(startSec),
+    "-t",
+    String(Math.max(0.01, endSec - startSec)),
+    "-vn",
+    "-acodec",
+    "libmp3lame",
+    "-b:a",
+    "128k",
+    outputAudioPath,
+  ], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const errorText = await new Response(proc.stderr).text();
+    const last5Lines = errorText
+      .trim()
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .slice(-5)
+      .join("\n");
+    throw new Error(`FFmpeg cutAudio failed (exit code ${exitCode}):\n${last5Lines}`);
+  }
+
+  return outputAudioPath;
+}
+
 export async function extractAudio16k(inputVideoPath: string, outputAudioPath: string): Promise<void> {
   const proc = Bun.spawn([
     "ffmpeg",
