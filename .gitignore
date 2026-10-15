@@ -6,6 +6,7 @@ dist/
 
 # Storage & media
 uploads/
+uploads-test/
 *.mp3
 *.srt
 *.mp4
@@ -27,6 +28,13 @@ source.mp4
 .dev.vars
 .env
 .env.*
+!.env.example
+!.dev.vars.example
+
+# Local agent/tool folders
+.agents/
+.commandcode/
+.hermes/
 
 # OS & Editor
 .DS_Store
