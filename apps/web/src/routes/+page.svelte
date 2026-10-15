@@ -5,8 +5,17 @@
 	import TranscriptEditor from '#lib/components/TranscriptEditor.svelte';
 	import FontEditor from '#lib/components/FontEditor.svelte';
 	import RenderPanel from '#lib/components/RenderPanel.svelte';
+	import TimelineEditor from '#lib/components/TimelineEditor.svelte';
 	import UploadWizard from '#lib/components/UploadWizard.svelte';
 	import { cliperStore } from '#lib/stores/cliper.svelte';
+	import { gsapReveal } from '#lib/utils/motion';
+
+	let isUploadOpen = $state(false);
+	let isFontEditorOpen = $state(false);
+
+	$effect(() => {
+		if (cliperStore.transcribeStatus === 'loading') isFontEditorOpen = false;
+	});
 </script>
 
 <svelte:head>
@@ -15,82 +24,58 @@
 
 <div class="app-shell">
 	<!-- Top Bar / Header -->
-	<Header />
+	<Header onOpenUpload={() => (isUploadOpen = true)} />
 
-	<!-- Modal Wizard Upload (Multi-step) -->
+	{#if isUploadOpen}
+		<UploadPanel onClose={() => (isUploadOpen = false)} />
+	{/if}
+
 	{#if cliperStore.wizard.isOpen}
 		<UploadWizard />
 	{/if}
 
-	<!-- 3 Columns Layout -->
-	<main class="workspace-grid">
-		<!-- Panel Kiri: Upload & Video Source Preview -->
-		<UploadPanel />
+	<main class="app-main">
+		<div class="studio-grid" use:gsapReveal>
+			<section class="preview-column">
+				<Preview916 onEditCaption={() => (isFontEditorOpen = true)} showFontSample={isFontEditorOpen} />
+				<TimelineEditor />
+			</section>
 
-		<!-- Panel Tengah: Preview 9:16 (1080x1920 Scaled), Caption Box Gelap Tepi Terang, CropX -->
-		<Preview916 />
-
-		<!-- Panel Kanan: Editor Tabbed (Transkrip, Font, Render) -->
-		<aside class="panel panel-right">
-			<div class="panel-header">
-				<span class="panel-title">
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-						<path d="M12 20h9" />
-						<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-					</svg>
-					Studio Editor
-				</span>
-
-				<div class="tabs-nav">
+			<aside class="panel panel-right rounded-panel border border-line-subtle bg-surface" use:gsapReveal>
+				<div class="flex gap-1 border-b border-line-subtle px-[18px] max-sm:px-3.5" role="tablist" aria-label="Editor">
 					<button
-						class="tab-btn"
-						class:active={cliperStore.activeTab === 'transcript'}
-						onclick={() => (cliperStore.activeTab = 'transcript')}
+						class={`rounded-t-control border-b-2 px-3 pt-3 pb-2.5 text-[12px] font-semibold transition-colors ${!isFontEditorOpen ? 'border-accent text-accent' : 'border-transparent text-ink-muted hover:text-ink'}`}
+						role="tab"
+						aria-selected={!isFontEditorOpen}
+						onclick={() => (isFontEditorOpen = false)}
 					>
 						Transkrip
-						{#if cliperStore.cuts.length > 0}
-							<span class="tab-badge">{cliperStore.cuts.length}</span>
-						{/if}
 					</button>
-
 					<button
-						class="tab-btn"
-						class:active={cliperStore.activeTab === 'font'}
-						onclick={() => (cliperStore.activeTab = 'font')}
+						class={`rounded-t-control border-b-2 px-3 pt-3 pb-2.5 text-[12px] font-semibold transition-colors ${isFontEditorOpen ? 'border-accent text-accent' : 'border-transparent text-ink-muted hover:text-ink'}`}
+						role="tab"
+						aria-selected={isFontEditorOpen}
+						onclick={() => (isFontEditorOpen = true)}
 					>
-						Font & Box
-					</button>
-
-					<button
-						class="tab-btn"
-						class:active={cliperStore.activeTab === 'render'}
-						onclick={() => (cliperStore.activeTab = 'render')}
-					>
-						Render
+						Caption
 					</button>
 				</div>
-			</div>
 
-			<div class="panel-body">
-				{#if cliperStore.activeTab === 'transcript'}
-					<TranscriptEditor />
-				{:else if cliperStore.activeTab === 'font'}
+				<div class="panel-body bg-surface">
+					{#key isFontEditorOpen}
+					<div class="panel-view" use:gsapReveal>
+				{#if isFontEditorOpen}
 					<FontEditor />
-				{:else if cliperStore.activeTab === 'render'}
-					<RenderPanel />
+				{:else}
+					<TranscriptEditor />
 				{/if}
-			</div>
-		</aside>
+					</div>
+					{/key}
+				</div>
+			</aside>
+		</div>
+		{#if cliperStore.render.status !== 'idle'}
+			<RenderPanel />
+		{/if}
 	</main>
 </div>
-
-<style>
-	.tab-badge {
-		font-size: 9px;
-		background: var(--accent-rose);
-		color: #fff;
-		padding: 1px 4px;
-		border-radius: 8px;
-		margin-left: 2px;
-	}
-</style>
